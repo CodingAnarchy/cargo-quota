@@ -176,6 +176,7 @@ fn scan_profile(profile: &Path, profile_name: &str, index: usize) -> Vec<Unit> {
         .keys()
         .map(|k| (unit_hash(k).unwrap().to_owned(), k.clone()))
         .collect();
+    let unhashed = unhashed_outputs(profile, &by_key);
     for sub in ["build", "deps", "examples"] {
         for (name, path) in entries(&profile.join(sub)) {
             if let Some(hash) = unit_hash(&name) {
@@ -184,6 +185,8 @@ fn scan_profile(profile: &Path, profile_name: &str, index: usize) -> Vec<Unit> {
                     fingerprints.get(hash).map_or(hash, String::as_str),
                     path,
                 );
+            } else if let Some(key) = name.split('.').next().and_then(|stem| unhashed.get(stem)) {
+                add(&mut by_key, key, path);
             }
         }
     }
@@ -192,6 +195,45 @@ fn scan_profile(profile: &Path, profile_name: &str, index: usize) -> Vec<Unit> {
     }
 
     by_key.into_values().collect()
+}
+
+/// Some binaries are written without the hash: on Windows MSVC (so `.pdb`
+/// names match) and wasm targets, `deps/app.exe` rather than
+/// `deps/app-<hash>.exe`. Their unit's fingerprint dir still records the
+/// target name (`bin-app`, `example-demo`), so map file stems back to units.
+/// If several units claim a name, the most recently used one owns the file,
+/// since it's the one that wrote it last.
+fn unhashed_outputs(
+    profile: &Path,
+    fingerprint_units: &HashMap<String, Unit>,
+) -> HashMap<String, String> {
+    let mut owners: HashMap<String, (&String, SystemTime)> = HashMap::new();
+    for (key, unit) in fingerprint_units {
+        for (file, _) in entries(&profile.join(".fingerprint").join(key)) {
+            let Some(target) = file
+                .strip_prefix("bin-")
+                .or_else(|| file.strip_prefix("example-"))
+            else {
+                continue;
+            };
+            // Skip `bin-app.json` and the like; the bare `bin-app` names the target.
+            if target.contains('.') {
+                continue;
+            }
+            // rustc names outputs after the crate name, which uses underscores.
+            let stem = target.replace('-', "_");
+            if owners
+                .get(&stem)
+                .is_none_or(|(_, used)| unit.last_used > *used)
+            {
+                owners.insert(stem, (key, unit.last_used));
+            }
+        }
+    }
+    owners
+        .into_iter()
+        .map(|(stem, (key, _))| (stem, key.clone()))
+        .collect()
 }
 
 /// Extracts cargo's metadata hash from an artifact name: the 16 lowercase hex
@@ -351,6 +393,52 @@ mod tests {
             common_ancestor([Path::new("/p/main/target")].into_iter()),
             Path::new("/p/main/target")
         );
+    }
+
+    #[test]
+    fn claims_unhashed_binaries_for_their_unit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path().join("debug");
+        let write = |p: &str| {
+            let path = profile.join(p);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "x").unwrap();
+        };
+        // A Windows MSVC build of bin `my-app` depending on lib `dep`.
+        write(".fingerprint/my-app-0123456789abcdef/bin-my-app");
+        write(".fingerprint/my-app-0123456789abcdef/bin-my-app.json");
+        write(".fingerprint/dep-fedcba9876543210/lib-dep");
+        write("deps/my_app.exe");
+        write("deps/my_app.pdb");
+        write("deps/my_app.d");
+        write("deps/libdep-fedcba9876543210.rlib");
+        write("deps/unrelated.exe");
+
+        let units = scan_profile(&profile, "debug", 0);
+        let files = |label: &str| -> Vec<String> {
+            let unit = units.iter().find(|u| u.label == label).unwrap();
+            let mut names: Vec<String> = unit
+                .paths
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            files("debug/my-app-0123456789abcdef"),
+            [
+                "my-app-0123456789abcdef",
+                "my_app.d",
+                "my_app.exe",
+                "my_app.pdb"
+            ]
+        );
+        assert_eq!(
+            files("debug/dep-fedcba9876543210"),
+            ["dep-fedcba9876543210", "libdep-fedcba9876543210.rlib"]
+        );
+        assert_eq!(units.len(), 2, "unrelated.exe should belong to no unit");
     }
 
     #[test]
