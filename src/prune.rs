@@ -34,7 +34,7 @@ pub fn run(opts: &Opts, cargo_args: &[OsString], mode: Mode) -> Result<()> {
                 .take_while(|a| *a != "--")
                 .any(|a| a == "-q" || a == "--quiet"),
         verbose: opts.verbose,
-        color: io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
+        color: use_color(cargo_args),
     };
     let dry_run = opts.dry_run || mode == Mode::Status;
 
@@ -315,6 +315,19 @@ fn print_status(
             humantime::format_duration(settings.min_age)
         ),
     );
+}
+
+/// Colors our status lines the way cargo will color its own: a passthrough
+/// `--color` flag wins, then `CARGO_TERM_COLOR`, then auto-detection.
+fn use_color(cargo_args: &[OsString]) -> bool {
+    let choice = config::flag_value(cargo_args, "--color")
+        .map(|v| v.to_string_lossy().into_owned())
+        .or_else(|| std::env::var("CARGO_TERM_COLOR").ok());
+    match choice.as_deref() {
+        Some("always") => true,
+        Some("never") => false,
+        _ => io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
+    }
 }
 
 struct Output {

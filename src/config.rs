@@ -317,7 +317,7 @@ fn cargo_metadata(manifest_path: Option<&PathBuf>, target_dir: Option<&PathBuf>)
 }
 
 /// Finds `--flag value` or `--flag=value` in passthrough args, stopping at `--`.
-fn flag_value(args: &[OsString], flag: &str) -> Option<PathBuf> {
+pub fn flag_value(args: &[OsString], flag: &str) -> Option<PathBuf> {
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let arg = arg.to_str()?;
