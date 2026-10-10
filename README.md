@@ -20,8 +20,13 @@ $ cargo quota build --release
 ## Install
 
 ```sh
-cargo install --path .
+cargo install cargo-quota
 ```
+
+This puts `cargo-quota` in `~/.cargo/bin`, and cargo runs it as `cargo quota`.
+Requires Rust 1.95 or newer.
+
+To install from a local checkout instead, run `cargo install --path .`.
 
 ## Usage
 
