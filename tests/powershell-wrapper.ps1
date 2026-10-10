@@ -8,6 +8,8 @@ Invoke-Expression $snippet
 Set-Location $Project
 $env:CARGO_QUOTA_PERCENT = '0.0000001'
 
+# A fresh project has no target dir yet, so the first build has nothing to prune.
+cargo build 2>&1 | Out-Null
 $out = cargo build 2>&1 | Out-String
 if ($out -notmatch 'Pruning') { throw "build did not prune:`n$out" }
 $out = cargo +stable build 2>&1 | Out-String
