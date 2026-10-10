@@ -5,6 +5,8 @@ edition = "2024"
 rust-version = "1.89"
 description = "Keep cargo's target directory under a disk-space budget by pruning the least recently used build artifacts before each build"
 license = "MIT"
+repository = "https://github.com/CodingAnarchy/cargo-quota"
+readme = "README.md"
 keywords = ["cargo", "clean", "target", "disk", "prune"]
 categories = ["development-tools::cargo-plugins", "command-line-utilities"]
 
