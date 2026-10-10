@@ -2,7 +2,7 @@
 name = "cargo-quota"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.95"
 description = "Keep cargo's target directory under a disk-space budget by pruning the least recently used build artifacts before each build"
 license = "MIT"
 repository = "https://github.com/CodingAnarchy/cargo-quota"
