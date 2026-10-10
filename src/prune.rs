@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 
 use crate::config::{self, Opts, Settings};
 use crate::disk;
-use crate::scan::{self, Unit};
+use crate::scan::{Scan, Unit};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -41,12 +41,16 @@ pub fn run(opts: &Opts, cargo_args: &[OsString], mode: Mode) -> Result<()> {
     let capacity = disk::total_space(&settings.target_dir, settings.basis)?;
     let limit = (capacity as f64 * settings.percent / 100.0) as u64;
     let goal = (limit as f64 * settings.low_water) as u64;
-    let scan = scan::scan(&settings.target_dir, &settings.build_dir);
+    let mut scan = Scan::measure(&settings.dirs);
+    let over_budget = scan.total_bytes > limit;
+    if over_budget || mode == Mode::Status {
+        scan.find_units();
+    }
 
     if mode == Mode::Status {
         print_status(&out, &settings, &scan, capacity, limit, goal);
     }
-    if scan.total_bytes <= limit {
+    if !over_budget {
         if mode != Mode::BeforeBuild || out.verbose {
             out.status(
                 "Quota",
@@ -83,16 +87,23 @@ pub fn run(opts: &Opts, cargo_args: &[OsString], mode: Mode) -> Result<()> {
         .unwrap_or(SystemTime::UNIX_EPOCH);
     let plan = plan(&scan.units, scan.total_bytes, goal, cutoff, busy);
 
+    let over = match scan.roots.as_slice() {
+        [(root, _)] => format!(
+            "{} is {}, over its {} budget",
+            root.display(),
+            bytes(scan.total_bytes),
+            bytes(limit)
+        ),
+        roots => format!(
+            "{} target dirs total {}, over their shared {} budget",
+            roots.len(),
+            bytes(scan.total_bytes),
+            bytes(limit)
+        ),
+    };
     out.status(
         if dry_run { "Over quota" } else { "Pruning" },
-        &format!(
-            "{} is {}, over its {} budget ({}% of {})",
-            settings.target_dir.display(),
-            bytes(scan.total_bytes),
-            bytes(limit),
-            settings.percent,
-            bytes(capacity)
-        ),
+        &format!("{over} ({}% of {})", settings.percent, bytes(capacity)),
     );
 
     let mut freed = 0;
@@ -253,14 +264,28 @@ fn remove_all(paths: &[PathBuf], out: &Output) -> bool {
 fn print_status(
     out: &Output,
     settings: &Settings,
-    scan: &scan::Scan,
+    scan: &Scan,
     capacity: u64,
     limit: u64,
     goal: u64,
 ) {
-    out.status("Target dir", &settings.target_dir.display().to_string());
-    if settings.build_dir != settings.target_dir {
-        out.status("Build dir", &settings.build_dir.display().to_string());
+    match scan.roots.as_slice() {
+        [] => out.status(
+            "Target dir",
+            &format!("{} (not built yet)", settings.target_dir.display()),
+        ),
+        [(root, _)] => out.status("Target dir", &root.display().to_string()),
+        roots => {
+            for (root, size) in roots {
+                out.status(
+                    "Target dir",
+                    &format!("{} ({})", root.display(), bytes(*size)),
+                );
+            }
+        }
+    }
+    if settings.worktrees && scan.roots.len() <= 1 {
+        out.status("Worktrees", "no other worktrees have their own target dir");
     }
     let oldest = scan.units.iter().map(|u| u.last_used).min();
     out.status(

@@ -22,6 +22,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 use std::time::SystemTime;
 
 #[derive(Debug)]
@@ -38,47 +41,94 @@ pub struct Unit {
 
 #[derive(Debug)]
 pub struct Scan {
+    /// Distinct top-level directories scanned, with their on-disk sizes.
+    pub roots: Vec<(PathBuf, u64)>,
     /// Profile directories, e.g. `target/debug`, `target/aarch64-apple-darwin/release`.
     pub profiles: Vec<PathBuf>,
     pub units: Vec<Unit>,
-    /// On-disk size of the target and build directories, counting hard links once.
+    /// On-disk size of all roots, counting hard links once.
     pub total_bytes: u64,
 }
 
-pub fn scan(target_dir: &Path, build_dir: &Path) -> Scan {
-    let mut seen = HashSet::new();
-    let mut total = Usage::default();
-    measure(target_dir, &mut total, Some(&mut seen));
-    if build_dir != target_dir {
-        measure(build_dir, &mut total, Some(&mut seen));
+impl Scan {
+    /// Measures `dirs` (target dirs, build dirs, other worktrees' target dirs)
+    /// as one pool. Duplicates and directories nested inside another count
+    /// once. Units aren't grouped until [`Scan::find_units`].
+    pub fn measure(dirs: &[PathBuf]) -> Scan {
+        let seen = Mutex::new(HashSet::new());
+        let mut total_bytes = 0;
+        let mut roots = Vec::new();
+        for root in distinct_roots(dirs) {
+            let bytes = measure_parallel(&root, &seen);
+            total_bytes += bytes;
+            roots.push((root, bytes));
+        }
+        Scan {
+            roots,
+            profiles: Vec::new(),
+            units: Vec::new(),
+            total_bytes,
+        }
     }
 
-    let profiles = find_profiles(build_dir);
-    let mut units = Vec::new();
-    for (index, profile) in profiles.iter().enumerate() {
-        let name = profile
-            .strip_prefix(build_dir)
-            .unwrap_or(profile)
-            .display()
-            .to_string();
-        units.extend(scan_profile(profile, &name, index));
-    }
-
-    Scan {
-        profiles,
-        units,
-        total_bytes: total.bytes,
+    /// Groups the roots' contents into units. This walks everything again, so
+    /// it's skipped when the pool is under budget.
+    pub fn find_units(&mut self) {
+        // Labels are relative to whatever the roots have in common: `debug/...`
+        // for one target dir, `proj-feature/target/debug/...` across worktrees.
+        let base = common_ancestor(self.roots.iter().map(|(r, _)| r.as_path()));
+        self.profiles = self
+            .roots
+            .iter()
+            .flat_map(|(r, _)| find_profiles(r))
+            .collect();
+        self.units.clear();
+        for (index, profile) in self.profiles.iter().enumerate() {
+            let name = profile
+                .strip_prefix(&base)
+                .unwrap_or(profile)
+                .display()
+                .to_string();
+            self.units.extend(scan_profile(profile, &name, index));
+        }
     }
 }
 
-/// How far below the build dir to look for profile dirs.
+/// Canonicalizes and dedups `dirs`, dropping missing ones and any nested
+/// inside another (which scanning the outer one already covers).
+fn distinct_roots(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = dirs.iter().filter_map(|d| d.canonicalize().ok()).collect();
+    // Sorting puts each directory right before anything nested inside it.
+    roots.sort();
+    roots.dedup();
+    let mut distinct: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        if !distinct.iter().any(|outer| root.starts_with(outer)) {
+            distinct.push(root);
+        }
+    }
+    distinct
+}
+
+fn common_ancestor<'a>(mut paths: impl Iterator<Item = &'a Path>) -> PathBuf {
+    let Some(first) = paths.next() else {
+        return PathBuf::new();
+    };
+    let mut base = first.to_owned();
+    for path in paths {
+        while !path.starts_with(&base) && base.pop() {}
+    }
+    base
+}
+
+/// How far below a root to look for profile dirs.
 const MAX_PROFILE_DEPTH: usize = 6;
 
 /// Profile dirs are recognized by their `.fingerprint/` subdirectory. They're
-/// usually `<build_dir>/<profile>` or, when cross-compiling,
-/// `<build_dir>/<triple>/<profile>`, but people also point `CARGO_TARGET_DIR`
+/// usually `<target>/<profile>` or, when cross-compiling,
+/// `<target>/<triple>/<profile>`, but people also point `CARGO_TARGET_DIR`
 /// at subdirectories of `target/`, nesting whole target dirs inside it.
-fn find_profiles(build_dir: &Path) -> Vec<PathBuf> {
+fn find_profiles(root: &Path) -> Vec<PathBuf> {
     fn visit(dir: &Path, depth: usize, profiles: &mut Vec<PathBuf>) {
         if dir.join(".fingerprint").is_dir() {
             profiles.push(dir.to_owned());
@@ -89,7 +139,7 @@ fn find_profiles(build_dir: &Path) -> Vec<PathBuf> {
         }
     }
     let mut profiles = Vec::new();
-    for sub in subdirs(build_dir) {
+    for sub in subdirs(root) {
         visit(&sub, 1, &mut profiles);
     }
     profiles.sort();
@@ -157,6 +207,38 @@ pub fn unit_hash(name: &str) -> Option<&str> {
     })
 }
 
+/// [`measure`]s `root`'s on-disk size using all cores. Target dirs hold
+/// hundreds of thousands of files, and this runs before every build.
+fn measure_parallel(root: &Path, seen: &Mutex<HashSet<(u64, u64)>>) -> u64 {
+    // Two levels down (`target/debug/deps`, ...) there's enough independent
+    // work to spread around. Directories themselves don't count toward size.
+    let mut jobs = Vec::new();
+    for (_, child) in entries(root) {
+        if child.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+            jobs.extend(entries(&child).map(|(_, grandchild)| grandchild));
+        } else {
+            jobs.push(child);
+        }
+    }
+
+    let next = AtomicUsize::new(0);
+    let workers = thread::available_parallelism().map_or(4, |n| n.get().min(8));
+    thread::scope(|s| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut usage = Usage::default();
+                    while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        measure(job, &mut usage, Some(seen));
+                    }
+                    usage.bytes
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap_or(0)).sum()
+    })
+}
+
 #[derive(Default)]
 struct Usage {
     bytes: u64,
@@ -165,7 +247,7 @@ struct Usage {
 
 /// Recursively adds up on-disk size and the newest use time under `path`,
 /// without following symlinks. With `seen`, hard-linked files count once.
-fn measure(path: &Path, usage: &mut Usage, mut seen: Option<&mut HashSet<(u64, u64)>>) {
+fn measure(path: &Path, usage: &mut Usage, seen: Option<&Mutex<HashSet<(u64, u64)>>>) {
     let Ok(meta) = fs::symlink_metadata(path) else {
         return;
     };
@@ -183,7 +265,7 @@ fn measure(path: &Path, usage: &mut Usage, mut seen: Option<&mut HashSet<(u64, u
 
     if meta.is_dir() {
         for (_, child) in entries(path) {
-            measure(&child, usage, seen.as_deref_mut());
+            measure(&child, usage, seen);
         }
         return;
     }
@@ -191,7 +273,9 @@ fn measure(path: &Path, usage: &mut Usage, mut seen: Option<&mut HashSet<(u64, u
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if meta.nlink() > 1 && seen.is_some_and(|s| !s.insert((meta.dev(), meta.ino()))) {
+        if meta.nlink() > 1
+            && seen.is_some_and(|s| !s.lock().unwrap().insert((meta.dev(), meta.ino())))
+        {
             return;
         }
         usage.bytes += meta.blocks() * 512;
@@ -238,6 +322,35 @@ mod tests {
         );
         assert_eq!(unit_hash(&format!("proc-macro2-{h}")), Some(h));
         assert_eq!(unit_hash(&format!("my-tool-{h}.dSYM")), Some(h));
+    }
+
+    #[test]
+    fn collapses_duplicate_and_nested_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = |p: &str| {
+            let path = tmp.path().join(p);
+            fs::create_dir_all(&path).unwrap();
+            path
+        };
+        let main = dir("main/target");
+        let nested = dir("main/target/wt-a");
+        let other = dir("feature/target");
+        let missing = tmp.path().join("gone/target");
+        let roots = distinct_roots(&[nested, other.clone(), main.clone(), main.clone(), missing]);
+        assert_eq!(
+            roots,
+            [other.canonicalize().unwrap(), main.canonicalize().unwrap()]
+        );
+    }
+
+    #[test]
+    fn finds_common_ancestor() {
+        let paths = [Path::new("/p/main/target"), Path::new("/p/feature/target")];
+        assert_eq!(common_ancestor(paths.into_iter()), Path::new("/p"));
+        assert_eq!(
+            common_ancestor([Path::new("/p/main/target")].into_iter()),
+            Path::new("/p/main/target")
+        );
     }
 
     #[test]

@@ -6,18 +6,24 @@
 //! 4. `CARGO_QUOTA_*` environment variables (handy as a user-wide default)
 //! 5. built-in defaults
 //!
+//! The `--worktrees` flag can only turn worktree sharing on; set
+//! `worktrees = false` in Cargo.toml to override an environment default.
+//!
 //! Project config deliberately outranks the environment so that a global
 //! default in your shell profile doesn't override a project's own budget.
 
 use std::env;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::ValueEnum;
 use serde_json::Value;
+
+use crate::worktree;
 
 const DEFAULT_PERCENT: f64 = 5.0;
 const DEFAULT_LOW_WATER: f64 = 0.8;
@@ -41,6 +47,11 @@ pub struct Opts {
     /// Never remove artifacts used more recently than this, e.g. "30m", "2h", "1d" [default: 1h]
     #[arg(long, global = true)]
     pub min_age: Option<humantime::Duration>,
+
+    /// Share the budget with this repository's other git worktrees, pruning
+    /// the least recently used artifacts across all of their target dirs
+    #[arg(long, global = true)]
+    pub worktrees: bool,
 
     /// Report what would be removed without removing it
     #[arg(long, global = true)]
@@ -77,10 +88,13 @@ pub struct Settings {
     pub basis: Basis,
     pub low_water: f64,
     pub min_age: Duration,
-    /// Where final artifacts go (`target/`).
+    /// The target dir cargo would use here. Disk capacity is measured on its volume.
     pub target_dir: PathBuf,
-    /// Where intermediate artifacts go. Same as `target_dir` unless `build.build-dir` is set.
-    pub build_dir: PathBuf,
+    /// Every directory that shares the budget: this project's target dir and
+    /// build dir (`build.build-dir`, usually the same), plus those of other
+    /// worktrees when `worktrees` is on. May overlap; the scanner dedups.
+    pub dirs: Vec<PathBuf>,
+    pub worktrees: bool,
 }
 
 /// Resolves settings for the project cargo would operate on. `cargo_args` are
@@ -98,19 +112,19 @@ pub fn resolve(opts: &Opts, cargo_args: &[OsString]) -> Result<Option<Settings>>
         .or_else(|| flag_value(cargo_args, "--target-dir"));
 
     let metadata = cargo_metadata(manifest_path.as_ref(), target_override.as_ref());
-    let (target_dir, build_dir, file) = match (metadata, target_override) {
+    let (target_dir, mut dirs, workspace_root, file) = match (metadata, target_override) {
         (Some(meta), _) => {
-            let target = PathBuf::from(
-                meta["target_directory"]
-                    .as_str()
-                    .context("cargo metadata: no target_directory")?,
-            );
-            let build = meta["build_directory"]
-                .as_str()
-                .map_or_else(|| target.clone(), PathBuf::from);
-            (target, build, FileConfig::from_metadata(&meta))
+            let [target, build] =
+                output_dirs(&meta).context("cargo metadata: no target_directory")?;
+            let root = meta["workspace_root"].as_str().map(PathBuf::from);
+            (
+                target.clone(),
+                vec![target, build],
+                root,
+                FileConfig::from_metadata(&meta),
+            )
         }
-        (None, Some(dir)) => (dir.clone(), dir, FileConfig::default()),
+        (None, Some(dir)) => (dir.clone(), vec![dir], None, FileConfig::default()),
         (None, None) => return Ok(None),
     };
 
@@ -152,14 +166,72 @@ pub fn resolve(opts: &Opts, cargo_args: &[OsString]) -> Result<Option<Settings>>
         },
     };
 
+    let worktrees = match opts.worktrees.then_some(true).or(file.worktrees) {
+        Some(w) => w,
+        None => match env::var("CARGO_QUOTA_WORKTREES") {
+            Ok(s) => parse_bool(&s).with_context(|| format!("CARGO_QUOTA_WORKTREES={s}"))?,
+            Err(_) => false,
+        },
+    };
+    if worktrees && let Some(root) = &workspace_root {
+        dirs.extend(worktree_dirs(root));
+    }
+
     Ok(Some(Settings {
         percent,
         basis,
         low_water,
         min_age,
         target_dir,
-        build_dir,
+        dirs,
+        worktrees,
     }))
+}
+
+/// The target and build dirs from `cargo metadata` output.
+fn output_dirs(meta: &Value) -> Option<[PathBuf; 2]> {
+    let target = PathBuf::from(meta["target_directory"].as_str()?);
+    let build = meta["build_directory"]
+        .as_str()
+        .map_or_else(|| target.clone(), PathBuf::from);
+    Some([target, build])
+}
+
+/// Target and build dirs of the same workspace in every other worktree of
+/// `workspace_root`'s repository. Each worktree is asked via `cargo metadata`,
+/// in parallel, so per-worktree `.cargo/config.toml` settings are honored.
+fn worktree_dirs(workspace_root: &Path) -> Vec<PathBuf> {
+    let Some(worktrees) = worktree::find(workspace_root) else {
+        return Vec::new();
+    };
+    // The workspace may be a subdirectory of the repository.
+    let relative = workspace_root
+        .canonicalize()
+        .ok()
+        .and_then(|r| r.strip_prefix(&worktrees.current).ok().map(Path::to_owned))
+        .unwrap_or_default();
+
+    thread::scope(|s| {
+        let lookups: Vec<_> = worktrees
+            .others
+            .iter()
+            .map(|other| {
+                let manifest = other.join(&relative).join("Cargo.toml");
+                s.spawn(move || {
+                    // The workspace may not exist on that worktree's branch.
+                    if !manifest.is_file() {
+                        return None;
+                    }
+                    output_dirs(&cargo_metadata(Some(&manifest), None)?)
+                })
+            })
+            .collect();
+        lookups
+            .into_iter()
+            .filter_map(|l| l.join().ok().flatten())
+            .flatten()
+            .collect()
+    })
 }
 
 #[derive(Default)]
@@ -168,6 +240,7 @@ struct FileConfig {
     basis: Option<Basis>,
     low_water: Option<f64>,
     min_age: Option<Duration>,
+    worktrees: Option<bool>,
 }
 
 impl FileConfig {
@@ -214,6 +287,12 @@ impl FileConfig {
             match v.as_str().map(humantime::parse_duration) {
                 Some(Ok(d)) => self.min_age = Some(d),
                 _ => warn("min-age"),
+            }
+        }
+        if let Some(v) = table.get("worktrees") {
+            match v.as_bool() {
+                Some(w) => self.worktrees = Some(w),
+                None => warn("worktrees"),
             }
         }
     }
@@ -265,6 +344,14 @@ fn parse_basis(s: &str) -> Result<Basis> {
     }
 }
 
+fn parse_bool(s: &str) -> Result<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "" | "0" | "false" | "no" | "off" => Ok(false),
+        _ => bail!("expected true or false"),
+    }
+}
+
 fn env_parse(var: &str) -> Result<Option<f64>> {
     match env::var(var) {
         Ok(s) => Ok(Some(
@@ -303,7 +390,7 @@ mod tests {
     fn package_config_overrides_workspace_config() {
         let meta = serde_json::json!({
             "workspace_root": "/ws",
-            "metadata": { "quota": { "percent": 3, "min-age": "2h" } },
+            "metadata": { "quota": { "percent": 3, "min-age": "2h", "worktrees": true } },
             "packages": [
                 { "manifest_path": "/ws/member/Cargo.toml", "metadata": { "quota": { "percent": 50 } } },
                 { "manifest_path": "/ws/Cargo.toml", "metadata": { "quota": { "percent": 7.5, "basis": "system" } } },
@@ -314,5 +401,6 @@ mod tests {
         assert_eq!(config.basis, Some(Basis::System));
         assert_eq!(config.min_age, Some(Duration::from_secs(2 * 60 * 60)));
         assert_eq!(config.low_water, None);
+        assert_eq!(config.worktrees, Some(true));
     }
 }

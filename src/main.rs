@@ -2,6 +2,7 @@ mod config;
 mod disk;
 mod prune;
 mod scan;
+mod worktree;
 
 use std::env;
 use std::ffi::OsString;
