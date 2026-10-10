@@ -67,12 +67,12 @@ end
 ```sh
 # bash / zsh
 cargo() {
-  local tc=()
-  if [[ $1 == +* ]]; then tc=("$1"); shift; fi
-  case $1 in
-    build|b|check|c|test|t|run|r|bench|clippy) command cargo "${tc[@]}" quota "$@" ;;
-    *) command cargo "${tc[@]}" "$@" ;;
+  local toolchain=
+  if [[ ${1-} == +* ]]; then toolchain=$1; shift; fi
+  case ${1-} in
+    build|b|check|c|test|t|run|r|bench|clippy) set -- quota "$@" ;;
   esac
+  command cargo ${toolchain:+"$toolchain"} "$@"
 }
 ```
 
