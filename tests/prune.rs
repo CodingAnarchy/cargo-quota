@@ -220,8 +220,15 @@ fn worktrees_share_a_budget_and_stale_worktrees_go_first() {
     let status = quota(&main, &["status", "--worktrees", "-p", TINY_BUDGET]);
     assert!(status.contains("2 target dirs total"), "{status}");
 
-    quota(&main, &["prune", "--worktrees", "-p", TINY_BUDGET]);
-    assert_eq!(mentions(&stale.join("target/debug/deps"), "app"), 0);
+    let stderr = quota(&main, &["prune", "--worktrees", "-v", "-p", TINY_BUDGET]);
+    let left: Vec<PathBuf> = walk(&stale.join("target/debug/deps"))
+        .into_iter()
+        .filter(|p| relative_mentions(&stale.join("target/debug/deps"), p, "app"))
+        .collect();
+    assert!(
+        left.is_empty(),
+        "stale worktree units left behind: {left:#?}\n{stderr}"
+    );
     assert!(
         mentions(&main.join("target/debug/deps"), "app") > 0,
         "recent worktree was pruned"
