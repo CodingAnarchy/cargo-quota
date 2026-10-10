@@ -72,9 +72,27 @@ fn backdate(root: &Path, name: &str, age: Duration) {
     let times = FileTimes::new().set_accessed(when).set_modified(when);
     for path in walk(root) {
         if relative_mentions(root, &path, name) {
-            File::open(&path).unwrap().set_times(times).unwrap();
+            open_for_times(&path).set_times(times).unwrap();
         }
     }
+}
+
+/// Opens a file or directory so its timestamps can be set.
+fn open_for_times(path: &Path) -> File {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+        // Required to open a directory handle at all.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .unwrap()
+    }
+    #[cfg(not(windows))]
+    File::open(path).unwrap()
 }
 
 fn walk(dir: &Path) -> Vec<PathBuf> {

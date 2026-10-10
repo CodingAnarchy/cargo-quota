@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use sysinfo::Disks;
@@ -15,6 +15,7 @@ pub fn total_space(target_dir: &Path, basis: Basis) -> Result<u64> {
             let path = target_dir
                 .ancestors()
                 .find_map(|p| p.canonicalize().ok())
+                .map(strip_verbatim)
                 .context("cannot resolve target directory")?;
             disks
                 .list()
@@ -38,4 +39,16 @@ pub fn total_space(target_dir: &Path, basis: Basis) -> Result<u64> {
             Ok(total)
         }
     }
+}
+
+/// On Windows, `canonicalize` returns verbatim paths (`\\?\C:\...`), which
+/// never `starts_with` a mount point like `C:\`. Elsewhere this is a no-op.
+fn strip_verbatim(path: PathBuf) -> PathBuf {
+    if cfg!(windows)
+        && let Some(rest) = path.to_str().and_then(|s| s.strip_prefix(r"\\?\"))
+        && !rest.starts_with(r"UNC\")
+    {
+        return PathBuf::from(rest);
+    }
+    path
 }
