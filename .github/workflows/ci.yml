@@ -26,6 +26,16 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked
       - run: cargo test --locked
+      - name: PowerShell wrapper from README
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:PATH = "$PWD\target\debug;$env:PATH"
+          cargo new --quiet "$env:RUNNER_TEMP\demo"
+          pwsh -NoProfile -File tests\powershell-wrapper.ps1 -Readme README.md -Project "$env:RUNNER_TEMP\demo"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          powershell -NoProfile -ExecutionPolicy Bypass -File tests\powershell-wrapper.ps1 -Readme README.md -Project "$env:RUNNER_TEMP\demo"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
   msrv:
     name: Minimum Rust version

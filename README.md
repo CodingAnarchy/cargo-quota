@@ -76,6 +76,23 @@ cargo() {
 }
 ```
 
+```powershell
+# PowerShell: add to your profile (run `notepad $PROFILE` to open it)
+function cargo {
+    $cargoExe = (Get-Command cargo -CommandType Application | Select-Object -First 1).Source
+    $rest = @($args)
+    $toolchain = @()
+    if ($rest.Count -gt 0 -and $rest[0] -like '+*') {
+        $toolchain = @($rest[0])
+        $rest = @($rest | Select-Object -Skip 1)
+    }
+    if ($rest.Count -gt 0 -and $rest[0] -cin 'build', 'b', 'check', 'c', 'test', 't', 'run', 'r', 'bench', 'clippy') {
+        $rest = @('quota') + $rest
+    }
+    & $cargoExe @toolchain @rest
+}
+```
+
 **Cargo aliases.** The short built-in aliases *can* be overridden, in
 `~/.cargo/config.toml` or a project's `.cargo/config.toml`:
 
