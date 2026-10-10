@@ -38,6 +38,7 @@ fn cargo(dir: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(dir)
         .env_remove("CARGO_TARGET_DIR")
+        .env("CARGO_TERM_COLOR", "never")
         .output()
         .unwrap();
     assert!(
@@ -53,6 +54,7 @@ fn quota(dir: &Path, args: &[&str]) -> String {
         .args(args)
         .current_dir(dir)
         .env_remove("CARGO_TARGET_DIR")
+        .env("CARGO_TERM_COLOR", "never")
         .env("CARGO", env!("CARGO"))
         .output()
         .unwrap();
