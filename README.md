@@ -56,7 +56,7 @@ function cargo --wraps cargo --description 'cargo, pruning target/ to its quota 
         set toolchain $argv[1]
         set -e argv[1]
     end
-    if contains -- "$argv[1]" build b check c test t run r bench clippy
+    if contains -- "$argv[1]" build b check c test t run r bench clippy doc d nextest
         command cargo $toolchain quota $argv
     else
         command cargo $toolchain $argv
@@ -70,7 +70,7 @@ cargo() {
   local toolchain=
   if [[ ${1-} == +* ]]; then toolchain=$1; shift; fi
   case ${1-} in
-    build|b|check|c|test|t|run|r|bench|clippy) set -- quota "$@" ;;
+    build|b|check|c|test|t|run|r|bench|clippy|doc|d|nextest) set -- quota "$@" ;;
   esac
   command cargo ${toolchain:+"$toolchain"} "$@"
 }
@@ -86,7 +86,7 @@ function cargo {
         $toolchain = @($rest[0])
         $rest = @($rest | Select-Object -Skip 1)
     }
-    if ($rest.Count -gt 0 -and $rest[0] -cin 'build', 'b', 'check', 'c', 'test', 't', 'run', 'r', 'bench', 'clippy') {
+    if ($rest.Count -gt 0 -and $rest[0] -cin 'build', 'b', 'check', 'c', 'test', 't', 'run', 'r', 'bench', 'clippy', 'doc', 'd', 'nextest') {
         $rest = @('quota') + $rest
     }
     & $cargoExe @toolchain @rest
@@ -109,13 +109,14 @@ approaches. That's fine: the next build from your shell catches up.
 
 ## Configuration
 
-| Setting     | Flag           | Cargo.toml key | Env var                 | Default  |
-|-------------|----------------|----------------|-------------------------|----------|
-| Budget      | `--percent`    | `percent`      | `CARGO_QUOTA_PERCENT`   | `5`      |
-| Basis       | `--basis`      | `basis`        | `CARGO_QUOTA_BASIS`     | `volume` |
-| Low water   | `--low-water`  | `low-water`    | `CARGO_QUOTA_LOW_WATER` | `0.8`    |
-| Keep recent | `--min-age`    | `min-age`      | `CARGO_QUOTA_MIN_AGE`   | `1h`     |
-| Worktrees   | `--worktrees`  | `worktrees`    | `CARGO_QUOTA_WORKTREES` | `false`  |
+| Setting     | Flag               | Cargo.toml key   | Env var                      | Default  |
+|-------------|--------------------|------------------|------------------------------|----------|
+| Budget      | `--percent`        | `percent`        | `CARGO_QUOTA_PERCENT`        | `5`      |
+| Basis       | `--basis`          | `basis`          | `CARGO_QUOTA_BASIS`          | `volume` |
+| Low water   | `--low-water`      | `low-water`      | `CARGO_QUOTA_LOW_WATER`      | `0.8`    |
+| Keep recent | `--min-age`        | `min-age`        | `CARGO_QUOTA_MIN_AGE`        | `1h`     |
+| Recheck     | `--check-interval` | `check-interval` | `CARGO_QUOTA_CHECK_INTERVAL` | `5m`     |
+| Worktrees   | `--worktrees`      | `worktrees`      | `CARGO_QUOTA_WORKTREES`      | `false`  |
 
 - **Budget** is the target directory's size limit, as a percentage of total
   disk space.
@@ -128,6 +129,9 @@ approaches. That's fine: the next build from your shell catches up.
 - **Keep recent**: anything used within this window is never removed, even if
   that leaves the directory over budget. This keeps a too-small budget from
   deleting the artifacts the current build is about to need.
+- **Recheck**: before a build, skip measuring if a check within this window
+  found the pool under its low-water mark. `0s` measures before every build.
+  `cargo quota prune` and `cargo quota status` always measure.
 - **Worktrees**: share one budget across all of the repository's git
   worktrees. See [Worktrees](#worktrees) below.
 
@@ -202,16 +206,24 @@ Each incremental-compilation cache under `incremental/` is its own unit.
   modification times are available, and "last used" means "last rebuilt".
 - **Speed**: when the pool is under budget, the only cost is measuring its
   size, which is spread across all cores. On a 19 GiB target dir with 190k
-  files, that takes about 0.9s, close to `du -s`.
+  files, that takes about 0.6s, close to `du -s`. The result is saved in
+  `target/.cargo-quota-stamp`. While it's recent (see Recheck) and comfortably
+  under budget, builds skip measuring, and the check costs about 50ms.
 - **Profile directories** are found by their `.fingerprint/` subdirectory at any
   depth. This covers `target/debug`, `target/<triple>/release`, and target dirs
   nested inside `target/` by `CARGO_TARGET_DIR`.
 - **Locking**: before removing anything from a profile directory,
   `cargo-quota` takes cargo's own `.cargo-lock` for it. If a build already
   holds the lock, that profile is skipped.
-- **Never removed**: `doc/`, `package/`, the final binaries cargo copies into
-  `target/debug/`, and anything else outside the per-unit layout. These still
-  count toward the total.
+- **Final outputs** that cargo copies up into the profile directory
+  (`target/debug/app`, `libfoo.rlib`, `examples/demo`) are removed with the
+  unit that built them.
+- **Whole directories** outside the profiles are units of their own, removed
+  all at once when they're the least recently used: `doc/`, `package/`,
+  `tmp/` (integration tests' `CARGO_TARGET_TMPDIR`), and the `criterion/` and
+  `nextest/` directories those tools create.
+- **Never removed**: anything else outside that layout, like
+  `.rustc_info.json`. It still counts toward the total.
 - The target and build directories come from `cargo metadata`, so
   `CARGO_TARGET_DIR`, `build.target-dir`, `build.build-dir`, `--target-dir`,
   and `--manifest-path` are all honored.

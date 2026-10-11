@@ -12,12 +12,16 @@
 //! ```
 //!
 //! Removing all of a unit's files together leaves cargo's state consistent: it
-//! sees no fingerprint and rebuilds that unit if it's ever needed again.
-//! Incremental compilation caches (`incremental/<crate>-<id>/`) use a different
-//! naming scheme, so each is its own unit.
+//! sees no fingerprint and rebuilds that unit if it's ever needed again. The
+//! copies cargo makes of final outputs (`debug/app`, `debug/libfoo.rlib`) go
+//! with the unit that produced them.
 //!
-//! Anything else (`doc/`, `package/`, uplifted binaries, `.cargo-lock`, ...)
-//! counts toward the total size but is never removed.
+//! Incremental compilation caches (`incremental/<crate>-<id>/`) use a different
+//! naming scheme, so each is its own unit. So are whole output directories
+//! outside the profiles, like `doc/` and `package/` (see [`EXTRA_DIRS`]).
+//!
+//! Anything else (`.rustc_info.json`, `.cargo-lock`, ...) counts toward the
+//! total size but is never removed.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -35,8 +39,9 @@ pub struct Unit {
     pub bytes: u64,
     /// Newest access or modification time of anything in the unit.
     pub last_used: SystemTime,
-    /// Index into [`Scan::profiles`].
-    pub profile: usize,
+    /// Indices into [`Scan::profiles`] whose `.cargo-lock` must be held to
+    /// remove the unit.
+    pub locks: Vec<usize>,
 }
 
 #[derive(Debug)]
@@ -82,14 +87,28 @@ impl Scan {
             .iter()
             .flat_map(|(r, _)| find_profiles(r))
             .collect();
+        let label = |path: &Path| {
+            path.strip_prefix(&base)
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        };
         self.units.clear();
         for (index, profile) in self.profiles.iter().enumerate() {
-            let name = profile
-                .strip_prefix(&base)
-                .unwrap_or(profile)
-                .display()
-                .to_string();
-            self.units.extend(scan_profile(profile, &name, index));
+            self.units
+                .extend(scan_profile(profile, &label(profile), index));
+        }
+        // Cargo writes these while holding a profile's lock (`doc/` under
+        // `debug/`'s, for instance), so require every lock in the root.
+        for (root, _) in &self.roots {
+            let locks: Vec<usize> = (0..self.profiles.len())
+                .filter(|&i| self.profiles[i].starts_with(root))
+                .collect();
+            for dir in find_extras(root, &self.profiles) {
+                let mut unit = Unit::new(label(&dir), locks.clone());
+                unit.add(dir);
+                self.units.push(unit);
+            }
         }
     }
 }
@@ -146,23 +165,67 @@ fn find_profiles(root: &Path) -> Vec<PathBuf> {
     profiles
 }
 
-fn scan_profile(profile: &Path, profile_name: &str, index: usize) -> Vec<Unit> {
-    let mut by_key: HashMap<String, Unit> = HashMap::new();
-    let add = |by_key: &mut HashMap<String, Unit>, key: &str, path: PathBuf| {
-        let mut usage = Usage::default();
-        measure(&path, &mut usage, None);
-        let unit = by_key.entry(key.to_owned()).or_insert_with(|| Unit {
-            label: format!("{profile_name}/{key}"),
+/// Output directories outside the profiles that are safe to remove whole:
+/// `cargo doc`, `cargo package`, integration tests' `CARGO_TARGET_TMPDIR`,
+/// and common tools' working directories.
+const EXTRA_DIRS: [&str; 5] = ["doc", "package", "tmp", "criterion", "nextest"];
+
+/// Finds [`EXTRA_DIRS`] in `root`, and in any directory there that holds
+/// profiles (`<triple>/doc`, or a target dir nested inside this one).
+fn find_extras(root: &Path, profiles: &[PathBuf]) -> Vec<PathBuf> {
+    fn visit(dir: &Path, depth: usize, profiles: &[PathBuf], extras: &mut Vec<PathBuf>) {
+        for sub in subdirs(dir) {
+            if profiles.iter().any(|p| p.starts_with(&sub)) {
+                if !profiles.contains(&sub) && depth < MAX_PROFILE_DEPTH {
+                    visit(&sub, depth + 1, profiles, extras);
+                }
+            } else if sub
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| EXTRA_DIRS.contains(&n))
+            {
+                extras.push(sub);
+            }
+        }
+    }
+    let mut extras = Vec::new();
+    visit(root, 1, profiles, &mut extras);
+    extras.sort();
+    extras
+}
+
+impl Unit {
+    fn new(label: String, locks: Vec<usize>) -> Unit {
+        Unit {
+            label,
             paths: Vec::new(),
             bytes: 0,
             last_used: SystemTime::UNIX_EPOCH,
-            profile: index,
-        });
-        unit.paths.push(path);
-        unit.bytes += usage.bytes;
-        unit.last_used = unit
+            locks,
+        }
+    }
+
+    fn add(&mut self, path: PathBuf) {
+        let mut usage = Usage::default();
+        measure(&path, &mut usage, None);
+        self.paths.push(path);
+        self.bytes += usage.bytes;
+        self.last_used = self
             .last_used
             .max(usage.newest.unwrap_or(SystemTime::UNIX_EPOCH));
+    }
+}
+
+/// Subdirectories of a profile dir that hold units, rather than being one.
+const PROFILE_SUBDIRS: [&str; 5] = [".fingerprint", "build", "deps", "examples", "incremental"];
+
+fn scan_profile(profile: &Path, profile_name: &str, index: usize) -> Vec<Unit> {
+    let mut by_key: HashMap<String, Unit> = HashMap::new();
+    let add = |by_key: &mut HashMap<String, Unit>, key: &str, path: PathBuf| {
+        by_key
+            .entry(key.to_owned())
+            .or_insert_with(|| Unit::new(format!("{profile_name}/{key}"), vec![index]))
+            .add(path);
     };
 
     // .fingerprint goes first so its package-named entry (`proc-macro2-<hash>`)
@@ -185,9 +248,17 @@ fn scan_profile(profile: &Path, profile_name: &str, index: usize) -> Vec<Unit> {
                     fingerprints.get(hash).map_or(hash, String::as_str),
                     path,
                 );
-            } else if let Some(key) = name.split('.').next().and_then(|stem| unhashed.get(stem)) {
+            } else if let Some(key) = unhashed_owner(&unhashed, &name) {
                 add(&mut by_key, key, path);
             }
+        }
+    }
+    // Final outputs copied up into the profile dir: `app`, `app.d`, `libfoo.rlib`, ...
+    for (name, path) in entries(profile) {
+        if !PROFILE_SUBDIRS.contains(&name.as_str())
+            && let Some(key) = unhashed_owner(&unhashed, &name)
+        {
+            add(&mut by_key, key, path);
         }
     }
     for (name, path) in entries(&profile.join("incremental")) {
@@ -197,12 +268,14 @@ fn scan_profile(profile: &Path, profile_name: &str, index: usize) -> Vec<Unit> {
     by_key.into_values().collect()
 }
 
-/// Some binaries are written without the hash: on Windows MSVC (so `.pdb`
-/// names match) and wasm targets, `deps/app.exe` rather than
-/// `deps/app-<hash>.exe`. Their unit's fingerprint dir still records the
-/// target name (`bin-app`, `example-demo`), so map file stems back to units.
-/// If several units claim a name, the most recently used one owns the file,
-/// since it's the one that wrote it last.
+/// Some outputs are written without the hash. Cargo copies final outputs up
+/// into the profile dir (`debug/my-app`, `debug/libfoo.rlib`,
+/// `examples/demo`), and on Windows MSVC (so `.pdb` names match) and wasm
+/// targets, binaries are even built as `deps/my_app.exe`. Their unit's
+/// fingerprint dir still records the target name (`bin-my-app`, `lib-foo`,
+/// `example-demo`), so map file stems back to units. If several units claim
+/// a name, the most recently used one owns the file, since it's the one that
+/// wrote it last, and it's the last of them to be pruned.
 fn unhashed_outputs(
     profile: &Path,
     fingerprint_units: &HashMap<String, Unit>,
@@ -210,23 +283,29 @@ fn unhashed_outputs(
     let mut owners: HashMap<String, (&String, SystemTime)> = HashMap::new();
     for (key, unit) in fingerprint_units {
         for (file, _) in entries(&profile.join(".fingerprint").join(key)) {
-            let Some(target) = file
-                .strip_prefix("bin-")
-                .or_else(|| file.strip_prefix("example-"))
-            else {
-                continue;
-            };
             // Skip `bin-app.json` and the like; the bare `bin-app` names the target.
-            if target.contains('.') {
+            if file.contains('.') {
                 continue;
             }
-            // rustc names outputs after the crate name, which uses underscores.
-            let stem = target.replace('-', "_");
-            if owners
-                .get(&stem)
-                .is_none_or(|(_, used)| unit.last_used > *used)
+            // Copied-up binaries keep the target name; rustc's own output uses
+            // the crate name, with underscores.
+            let stems = if let Some(target) = file
+                .strip_prefix("bin-")
+                .or_else(|| file.strip_prefix("example-"))
             {
-                owners.insert(stem, (key, unit.last_used));
+                vec![target.to_owned(), target.replace('-', "_")]
+            } else if let Some(target) = file.strip_prefix("lib-") {
+                vec![format!("lib{}", target.replace('-', "_"))]
+            } else {
+                continue;
+            };
+            for stem in stems {
+                if owners
+                    .get(&stem)
+                    .is_none_or(|(_, used)| unit.last_used > *used)
+                {
+                    owners.insert(stem, (key, unit.last_used));
+                }
             }
         }
     }
@@ -234,6 +313,12 @@ fn unhashed_outputs(
         .into_iter()
         .map(|(stem, (key, _))| (stem, key.clone()))
         .collect()
+}
+
+/// The unit that owns an unhashed file, by the file's stem (`my-app` for
+/// `my-app.exe`, `my-app.dSYM`, ...).
+fn unhashed_owner<'a>(owners: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+    owners.get(name.split('.').next()?).map(String::as_str)
 }
 
 /// Extracts cargo's metadata hash from an artifact name: the 16 lowercase hex
@@ -413,6 +498,11 @@ mod tests {
         write("deps/my_app.d");
         write("deps/libdep-fedcba9876543210.rlib");
         write("deps/unrelated.exe");
+        // Copies cargo makes in the profile dir itself.
+        write("my-app.exe");
+        write("my-app.d");
+        write("libdep.rlib");
+        write(".cargo-lock");
 
         let units = scan_profile(&profile, "debug", 0);
         let files = |label: &str| -> Vec<String> {
@@ -429,6 +519,8 @@ mod tests {
             files("debug/my-app-0123456789abcdef"),
             [
                 "my-app-0123456789abcdef",
+                "my-app.d",
+                "my-app.exe",
                 "my_app.d",
                 "my_app.exe",
                 "my_app.pdb"
@@ -436,9 +528,46 @@ mod tests {
         );
         assert_eq!(
             files("debug/dep-fedcba9876543210"),
-            ["dep-fedcba9876543210", "libdep-fedcba9876543210.rlib"]
+            [
+                "dep-fedcba9876543210",
+                "libdep-fedcba9876543210.rlib",
+                "libdep.rlib"
+            ]
         );
         assert_eq!(units.len(), 2, "unrelated.exe should belong to no unit");
+    }
+
+    #[test]
+    fn finds_extra_dirs_beside_profiles_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for dir in [
+            "debug/.fingerprint",
+            "debug/doc",
+            "doc/app",
+            "package",
+            "x86_64-unknown-linux-gnu/release/.fingerprint",
+            "x86_64-unknown-linux-gnu/doc",
+            "flycheck0",
+            "nested/debug/.fingerprint",
+            "nested/tmp",
+        ] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let profiles = find_profiles(root);
+        let extras: Vec<PathBuf> = find_extras(root, &profiles)
+            .into_iter()
+            .map(|p| p.strip_prefix(root).unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            extras,
+            [
+                PathBuf::from("doc"),
+                PathBuf::from("nested/tmp"),
+                PathBuf::from("package"),
+                Path::new("x86_64-unknown-linux-gnu").join("doc"),
+            ]
+        );
     }
 
     #[test]

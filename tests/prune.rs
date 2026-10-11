@@ -154,10 +154,38 @@ fn prunes_only_stale_units_and_cargo_rebuilds_them() {
         mentions(&target.join("debug/.fingerprint"), "app-") > 0,
         "recent unit was removed"
     );
+    assert!(target.join(APP).is_file(), "recent binary was removed");
 
     // Cargo notices the missing unit and rebuilds it.
     let rebuild = cargo(&project, &["build"]);
     assert!(String::from_utf8_lossy(&rebuild.stderr).contains("Compiling oldlib"));
+    let run = cargo(&project, &["run", "-q"]);
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "42");
+}
+
+/// The binary cargo copies up into the profile dir.
+const APP: &str = if cfg!(windows) {
+    "debug/app.exe"
+} else {
+    "debug/app"
+};
+
+#[test]
+fn prunes_docs_and_final_binaries_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("app");
+    create_project(&project);
+    cargo(&project, &["build", "-q"]);
+    cargo(&project, &["doc", "-q"]);
+    let target = project.join("target");
+    assert!(target.join(APP).is_file());
+    assert!(target.join("doc").is_dir());
+    backdate(&target, "", LONG_AGO);
+
+    quota(&project, &["prune", "-p", TINY_BUDGET]);
+    assert!(!target.join(APP).exists(), "stale binary left behind");
+    assert!(!target.join("doc").exists(), "stale docs left behind");
+
     let run = cargo(&project, &["run", "-q"]);
     assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "42");
 }
@@ -173,6 +201,28 @@ fn does_nothing_under_budget() {
     let stderr = quota(&project, &["prune", "-p", "100"]);
     assert!(stderr.contains("nothing to prune"), "{stderr}");
     assert!(mentions(&project.join("target/debug/deps"), "oldlib") > 0);
+}
+
+#[test]
+fn builds_soon_after_a_comfortable_check_skip_measuring() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("app");
+    create_project(&project);
+    cargo(&project, &["build"]);
+
+    let first = quota(&project, &["-v", "-p", "100", "build"]);
+    assert!(first.contains("nothing to prune"), "{first}");
+    let second = quota(&project, &["-v", "-p", "100", "build"]);
+    assert!(second.contains("not checking again yet"), "{second}");
+
+    // An over-budget setting can't be satisfied from a stamp that's above its low-water mark.
+    let tight = quota(&project, &["-v", "-p", TINY_BUDGET, "build"]);
+    assert!(tight.contains("Pruning"), "{tight}");
+    let never = quota(
+        &project,
+        &["-v", "--check-interval", "0s", "-p", "100", "build"],
+    );
+    assert!(never.contains("nothing to prune"), "{never}");
 }
 
 fn git(dir: &Path, args: &[&str]) {

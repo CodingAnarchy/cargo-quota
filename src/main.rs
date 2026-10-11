@@ -2,6 +2,7 @@ mod config;
 mod disk;
 mod prune;
 mod scan;
+mod stamp;
 mod worktree;
 
 use std::env;
@@ -89,9 +90,11 @@ fn run_cargo(args: &[OsString]) -> ExitCode {
         eprintln!("error: failed to run {}: {err}", cargo.to_string_lossy());
         ExitCode::FAILURE
     }
+    // `ExitCode` holds only a u8, which would turn codes like 256 or
+    // 0xC0000100 into 0, so pass cargo's code through whole.
     #[cfg(not(unix))]
     match cmd.status() {
-        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
         Err(err) => {
             eprintln!("error: failed to run {}: {err}", cargo.to_string_lossy());
             ExitCode::FAILURE

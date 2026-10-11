@@ -2,13 +2,13 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Result, bail};
 
 use crate::config::{self, Opts, Settings};
-use crate::disk;
 use crate::scan::{Scan, Unit};
+use crate::{disk, stamp};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -41,6 +41,29 @@ pub fn run(opts: &Opts, cargo_args: &[OsString], mode: Mode) -> Result<()> {
     let capacity = disk::total_space(&settings.target_dir, settings.basis)?;
     let limit = (capacity as f64 * settings.percent / 100.0) as u64;
     let goal = (limit as f64 * settings.low_water) as u64;
+
+    // Measuring is the slow part. Builds can't grow the dir from under the
+    // low-water mark to over budget often, so a recent comfortable reading
+    // is trusted for a while.
+    if mode == Mode::BeforeBuild
+        && let Some(last) = stamp::read(&settings.target_dir, &settings.dirs)
+        && last.age < settings.check_interval
+        && last.bytes <= goal
+    {
+        if out.verbose {
+            out.status(
+                "Quota",
+                &format!(
+                    "{} of {} budget used {} ago; not checking again yet",
+                    bytes(last.bytes),
+                    bytes(limit),
+                    humantime::format_duration(Duration::from_secs(last.age.as_secs()))
+                ),
+            );
+        }
+        return Ok(());
+    }
+
     let mut scan = Scan::measure(&settings.dirs);
     let over_budget = scan.total_bytes > limit;
     if over_budget || mode == Mode::Status {
@@ -51,6 +74,7 @@ pub fn run(opts: &Opts, cargo_args: &[OsString], mode: Mode) -> Result<()> {
         print_status(&out, &settings, &scan, capacity, limit, goal);
     }
     if !over_budget {
+        stamp::write(&settings.target_dir, &settings.dirs, scan.total_bytes);
         if mode != Mode::BeforeBuild || out.verbose {
             out.status(
                 "Quota",
@@ -72,7 +96,7 @@ pub fn run(opts: &Opts, cargo_args: &[OsString], mode: Mode) -> Result<()> {
     } else {
         scan.profiles.iter().map(|p| try_lock(p)).collect()
     };
-    let busy = |unit: &Unit| !dry_run && locks[unit.profile].is_none();
+    let busy = |unit: &Unit| !dry_run && unit.locks.iter().any(|&p| locks[p].is_none());
     for (profile, lock) in scan.profiles.iter().zip(&locks) {
         if !dry_run && lock.is_none() {
             out.warn(&format!(
@@ -147,6 +171,7 @@ pub fn run(opts: &Opts, cargo_args: &[OsString], mode: Mode) -> Result<()> {
     }
 
     let remaining = scan.total_bytes.saturating_sub(freed);
+    stamp::write(&settings.target_dir, &settings.dirs, remaining);
     if remaining > limit {
         let unmanaged = scan
             .total_bytes
@@ -163,10 +188,7 @@ pub fn run(opts: &Opts, cargo_args: &[OsString], mode: Mode) -> Result<()> {
                 plan.busy_bytes,
                 "in profiles another cargo process is using".to_owned(),
             ),
-            (
-                unmanaged,
-                "outside build profiles (doc/, package/, final binaries, ...)".to_owned(),
-            ),
+            (unmanaged, "that cargo-quota doesn't manage".to_owned()),
         ]
         .into_iter()
         .filter(|(n, _)| *n > 0)
@@ -388,7 +410,6 @@ fn ago(time: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     fn unit(label: &str, bytes: u64, days_ago: u64, profile: usize) -> Unit {
         Unit {
@@ -396,7 +417,7 @@ mod tests {
             paths: Vec::new(),
             bytes,
             last_used: SystemTime::now() - Duration::from_secs(days_ago * 24 * 60 * 60),
-            profile,
+            locks: vec![profile],
         }
     }
 
@@ -432,7 +453,7 @@ mod tests {
     #[test]
     fn skips_busy_profiles() {
         let units = vec![unit("locked", 10, 30, 1), unit("free", 10, 20, 0)];
-        let plan = plan(&units, 20, 0, SystemTime::now(), |u| u.profile == 1);
+        let plan = plan(&units, 20, 0, SystemTime::now(), |u| u.locks.contains(&1));
         assert_eq!(labels(&units, &plan), ["free"]);
         assert_eq!(plan.busy_bytes, 10);
     }

@@ -28,6 +28,7 @@ use crate::worktree;
 const DEFAULT_PERCENT: f64 = 5.0;
 const DEFAULT_LOW_WATER: f64 = 0.8;
 const DEFAULT_MIN_AGE: Duration = Duration::from_secs(60 * 60);
+const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(clap::Args, Debug, Default)]
 pub struct Opts {
@@ -47,6 +48,11 @@ pub struct Opts {
     /// Never remove artifacts used more recently than this, e.g. "30m", "2h", "1d" [default: 1h]
     #[arg(long, global = true)]
     pub min_age: Option<humantime::Duration>,
+
+    /// Before a build, skip measuring if a check this recent found the target
+    /// dir under its low-water mark. "0s" checks before every build [default: 5m]
+    #[arg(long, global = true)]
+    pub check_interval: Option<humantime::Duration>,
 
     /// Share the budget with this repository's other git worktrees, pruning
     /// the least recently used artifacts across all of their target dirs
@@ -88,6 +94,7 @@ pub struct Settings {
     pub basis: Basis,
     pub low_water: f64,
     pub min_age: Duration,
+    pub check_interval: Duration,
     /// The target dir cargo would use here. Disk capacity is measured on its volume.
     pub target_dir: PathBuf,
     /// Every directory that shares the budget: this project's target dir and
@@ -158,12 +165,12 @@ pub fn resolve(opts: &Opts, cargo_args: &[OsString]) -> Result<Option<Settings>>
 
     let min_age = match opts.min_age.map(Into::into).or(file.min_age) {
         Some(d) => d,
-        None => match env::var("CARGO_QUOTA_MIN_AGE") {
-            Ok(s) => {
-                humantime::parse_duration(&s).with_context(|| format!("CARGO_QUOTA_MIN_AGE={s}"))?
-            }
-            Err(_) => DEFAULT_MIN_AGE,
-        },
+        None => env_duration("CARGO_QUOTA_MIN_AGE")?.unwrap_or(DEFAULT_MIN_AGE),
+    };
+
+    let check_interval = match opts.check_interval.map(Into::into).or(file.check_interval) {
+        Some(d) => d,
+        None => env_duration("CARGO_QUOTA_CHECK_INTERVAL")?.unwrap_or(DEFAULT_CHECK_INTERVAL),
     };
 
     let worktrees = match opts.worktrees.then_some(true).or(file.worktrees) {
@@ -182,6 +189,7 @@ pub fn resolve(opts: &Opts, cargo_args: &[OsString]) -> Result<Option<Settings>>
         basis,
         low_water,
         min_age,
+        check_interval,
         target_dir,
         dirs,
         worktrees,
@@ -240,6 +248,7 @@ struct FileConfig {
     basis: Option<Basis>,
     low_water: Option<f64>,
     min_age: Option<Duration>,
+    check_interval: Option<Duration>,
     worktrees: Option<bool>,
 }
 
@@ -287,6 +296,12 @@ impl FileConfig {
             match v.as_str().map(humantime::parse_duration) {
                 Some(Ok(d)) => self.min_age = Some(d),
                 _ => warn("min-age"),
+            }
+        }
+        if let Some(v) = table.get("check-interval") {
+            match v.as_str().map(humantime::parse_duration) {
+                Some(Ok(d)) => self.check_interval = Some(d),
+                _ => warn("check-interval"),
             }
         }
         if let Some(v) = table.get("worktrees") {
@@ -361,6 +376,15 @@ fn env_parse(var: &str) -> Result<Option<f64>> {
     }
 }
 
+fn env_duration(var: &str) -> Result<Option<Duration>> {
+    match env::var(var) {
+        Ok(s) => Ok(Some(
+            humantime::parse_duration(s.trim()).with_context(|| format!("{var}={s}"))?,
+        )),
+        Err(_) => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,7 +414,7 @@ mod tests {
     fn package_config_overrides_workspace_config() {
         let meta = serde_json::json!({
             "workspace_root": "/ws",
-            "metadata": { "quota": { "percent": 3, "min-age": "2h", "worktrees": true } },
+            "metadata": { "quota": { "percent": 3, "min-age": "2h", "check-interval": "0s", "worktrees": true } },
             "packages": [
                 { "manifest_path": "/ws/member/Cargo.toml", "metadata": { "quota": { "percent": 50 } } },
                 { "manifest_path": "/ws/Cargo.toml", "metadata": { "quota": { "percent": 7.5, "basis": "system" } } },
@@ -400,6 +424,7 @@ mod tests {
         assert_eq!(config.percent, Some(7.5));
         assert_eq!(config.basis, Some(Basis::System));
         assert_eq!(config.min_age, Some(Duration::from_secs(2 * 60 * 60)));
+        assert_eq!(config.check_interval, Some(Duration::ZERO));
         assert_eq!(config.low_water, None);
         assert_eq!(config.worktrees, Some(true));
     }
