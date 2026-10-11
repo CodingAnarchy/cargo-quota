@@ -93,10 +93,13 @@ impl Scan {
                 .display()
                 .to_string()
         };
+        // A unit holds hard links to its own files (`debug/app` and
+        // `deps/app-<hash>`), and overcounting would stop pruning early.
+        let seen = Mutex::new(HashSet::new());
         self.units.clear();
         for (index, profile) in self.profiles.iter().enumerate() {
             self.units
-                .extend(scan_profile(profile, &label(profile), index));
+                .extend(scan_profile(profile, &label(profile), index, &seen));
         }
         // Cargo writes these while holding a profile's lock (`doc/` under
         // `debug/`'s, for instance), so require every lock in the root.
@@ -106,7 +109,7 @@ impl Scan {
                 .collect();
             for dir in find_extras(root, &self.profiles) {
                 let mut unit = Unit::new(label(&dir), locks.clone());
-                unit.add(dir);
+                unit.add(dir, &seen);
                 self.units.push(unit);
             }
         }
@@ -205,9 +208,9 @@ impl Unit {
         }
     }
 
-    fn add(&mut self, path: PathBuf) {
+    fn add(&mut self, path: PathBuf, seen: &Mutex<HashSet<(u64, u64)>>) {
         let mut usage = Usage::default();
-        measure(&path, &mut usage, None);
+        measure(&path, &mut usage, Some(seen));
         self.paths.push(path);
         self.bytes += usage.bytes;
         self.last_used = self
@@ -219,13 +222,18 @@ impl Unit {
 /// Subdirectories of a profile dir that hold units, rather than being one.
 const PROFILE_SUBDIRS: [&str; 5] = [".fingerprint", "build", "deps", "examples", "incremental"];
 
-fn scan_profile(profile: &Path, profile_name: &str, index: usize) -> Vec<Unit> {
+fn scan_profile(
+    profile: &Path,
+    profile_name: &str,
+    index: usize,
+    seen: &Mutex<HashSet<(u64, u64)>>,
+) -> Vec<Unit> {
     let mut by_key: HashMap<String, Unit> = HashMap::new();
     let add = |by_key: &mut HashMap<String, Unit>, key: &str, path: PathBuf| {
         by_key
             .entry(key.to_owned())
             .or_insert_with(|| Unit::new(format!("{profile_name}/{key}"), vec![index]))
-            .add(path);
+            .add(path, seen);
     };
 
     // .fingerprint goes first so its package-named entry (`proc-macro2-<hash>`)
@@ -504,7 +512,7 @@ mod tests {
         write("libdep.rlib");
         write(".cargo-lock");
 
-        let units = scan_profile(&profile, "debug", 0);
+        let units = scan_profile(&profile, "debug", 0, &Mutex::new(HashSet::new()));
         let files = |label: &str| -> Vec<String> {
             let unit = units.iter().find(|u| u.label == label).unwrap();
             let mut names: Vec<String> = unit
