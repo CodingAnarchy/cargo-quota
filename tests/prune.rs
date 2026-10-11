@@ -182,9 +182,16 @@ fn prunes_docs_and_final_binaries_too() {
     assert!(target.join("doc").is_dir());
     backdate(&target, "", LONG_AGO);
 
-    quota(&project, &["prune", "-p", TINY_BUDGET]);
-    assert!(!target.join(APP).exists(), "stale binary left behind");
-    assert!(!target.join("doc").exists(), "stale docs left behind");
+    let stderr = quota(&project, &["prune", "-v", "-p", TINY_BUDGET]);
+    assert!(
+        !target.join(APP).exists(),
+        "stale binary left behind\n{stderr}"
+    );
+    assert!(
+        !target.join("doc").exists(),
+        "stale docs left behind: {:#?}\n{stderr}",
+        walk(&target.join("doc"))
+    );
 
     let run = cargo(&project, &["run", "-q"]);
     assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "42");
