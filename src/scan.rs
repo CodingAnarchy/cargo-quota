@@ -415,11 +415,57 @@ fn measure(path: &Path, usage: &mut Usage, seen: Option<&Mutex<HashSet<(u64, u64
         }
         usage.bytes += meta.blocks() * 512;
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        if seen
+            .is_some_and(|s| windows_link_id(path).is_some_and(|id| !s.lock().unwrap().insert(id)))
+        {
+            return;
+        }
+        usage.bytes += meta.len();
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = seen;
         usage.bytes += meta.len();
     }
+}
+
+/// Extensions of the files cargo hard-links when copying final outputs up
+/// into the profile dir. Windows metadata doesn't include a link count, so
+/// finding one means opening the file; doing that for only these keeps it
+/// to a few thousand opens rather than every file in the target dir.
+#[cfg(windows)]
+const LINKED_EXTENSIONS: [&str; 6] = ["exe", "dll", "pdb", "lib", "rlib", "wasm"];
+
+/// `(volume serial, file index)` for a file with more than one hard link.
+#[cfg(windows)]
+fn windows_link_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let ext = path.extension()?.to_str()?;
+    if !LINKED_EXTENSIONS.contains(&ext) {
+        return None;
+    }
+    // No access rights are needed to read a file's attributes, and asking
+    // for none never conflicts with a running build's open handles.
+    let file = fs::OpenOptions::new().access_mode(0).open(path).ok()?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is open for the duration of the call, and `info` is
+    // a valid, writable BY_HANDLE_FILE_INFORMATION.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return None;
+    }
+    (info.nNumberOfLinks > 1).then(|| {
+        (
+            u64::from(info.dwVolumeSerialNumber),
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        )
+    })
 }
 
 fn entries(dir: &Path) -> impl Iterator<Item = (String, PathBuf)> {
@@ -576,6 +622,21 @@ mod tests {
                 Path::new("x86_64-unknown-linux-gnu").join("doc"),
             ]
         );
+    }
+
+    #[test]
+    fn counts_hard_links_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = tmp.path().join("deps/app-0123456789abcdef.exe");
+        fs::create_dir_all(original.parent().unwrap()).unwrap();
+        fs::write(&original, vec![1u8; 64 * 1024]).unwrap();
+        let mut one = Usage::default();
+        measure(tmp.path(), &mut one, Some(&Mutex::new(HashSet::new())));
+
+        fs::hard_link(&original, tmp.path().join("app.exe")).unwrap();
+        let mut both = Usage::default();
+        measure(tmp.path(), &mut both, Some(&Mutex::new(HashSet::new())));
+        assert_eq!(both.bytes, one.bytes);
     }
 
     #[test]
