@@ -317,15 +317,21 @@ fn removes_objects_that_rebuilds_replaced() {
     cargo(&project, &["build", "-q"]);
     let first = objects("app-");
     assert!(!first.is_empty(), "rustc kept no object files");
+    let mut rebuilds = String::new();
     for n in [1, 2] {
         fs::write(
             project.join("src/main.rs"),
             format!("fn main() {{ println!(\"{{}}\", oldlib::answer() + {n} - {n}); }}\n"),
         )
         .unwrap();
-        cargo(&project, &["build", "-q"]);
+        let build = cargo(&project, &["build", "-v"]);
+        rebuilds += &String::from_utf8_lossy(&build.stderr);
     }
-    assert!(objects("app-").len() > first.len());
+    assert!(
+        objects("app-").len() > first.len(),
+        "rebuilds added no objects: {:#?}\n{rebuilds}",
+        objects("app-")
+    );
 
     // Recently used and well under budget: only the replaced objects go.
     let stderr = quota(&project, &["prune", "-p", "100"]);
