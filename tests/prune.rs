@@ -1,7 +1,6 @@
 //! End-to-end: build real crates, make some artifacts look stale, prune, and
 //! check that cargo still builds afterward.
 
-use std::collections::HashSet;
 use std::fs::{self, File, FileTimes};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -39,6 +38,9 @@ fn cargo(dir: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(dir)
         .env_remove("CARGO_TARGET_DIR")
+        // CI caching turns incremental compilation off; build like a dev
+        // machine does.
+        .env_remove("CARGO_INCREMENTAL")
         .env("CARGO_TERM_COLOR", "never")
         .output()
         .unwrap();
@@ -298,6 +300,8 @@ fn worktrees_share_a_budget_and_stale_worktrees_go_first() {
 #[cfg(target_os = "macos")]
 #[test]
 fn removes_objects_that_rebuilds_replaced() {
+    use std::collections::HashSet;
+
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("app");
     create_project(&project);

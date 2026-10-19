@@ -399,14 +399,16 @@ pub fn replaced_objects(profile: &Path) -> Vec<(String, Vec<PathBuf>)> {
 
 /// Whether some codegen unit's object file is there from more than one
 /// compile: `<crate>-<hash>.<cgu>.<invocation>.rcgu.o` with the same `<cgu>`
-/// and different `<invocation>`s. Rustc versions that didn't tag objects by
-/// invocation overwrote them instead, so this is never true for those.
+/// and different `<invocation>`s. Only incremental compiles tag objects that
+/// way. The others, and rustc versions that didn't tag objects at all, name
+/// them `<crate>-<hash>.<crate>.<id>-cgu.<n>.rcgu.o` and overwrite them, so
+/// this is never true for those.
 fn recompiled(objects: &[(String, PathBuf)]) -> bool {
     let mut cgus = HashSet::new();
     objects.iter().any(|(name, _)| {
         name.strip_suffix(".rcgu.o")
             .and_then(|stem| stem.rsplit_once('.'))
-            .is_some_and(|(cgu, _)| !cgus.insert(cgu))
+            .is_some_and(|(cgu, _)| !cgu.ends_with("-cgu") && !cgus.insert(cgu))
     })
 }
 
@@ -832,6 +834,17 @@ mod tests {
             write(&obj(opaque, "x", invocation), b"o");
         }
         write(opaque, b"no names here");
+
+        // Compiled without incremental, into numbered codegen units that
+        // each compile overwrites. Its output only names one of them here.
+        let numbered = "numbered-0f1e2d3c4b5a6978";
+        for n in ["0", "1"] {
+            write(&obj(numbered, "numbered.0123abcd-cgu", n), b"o");
+        }
+        write(
+            numbered,
+            obj(numbered, "numbered.0123abcd-cgu", "0").as_bytes(),
+        );
 
         // Compiled once.
         let once = "once-ffeeddccbbaa0099";
