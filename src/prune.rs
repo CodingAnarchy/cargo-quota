@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Result, bail};
 
 use crate::config::{self, Opts, Settings};
-use crate::scan::{Scan, Unit};
+use crate::scan::{self, Scan, Unit};
 use crate::{disk, stamp};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -65,6 +65,11 @@ pub fn run(opts: &Opts, cargo_args: &[OsString], mode: Mode) -> Result<()> {
     }
 
     let mut scan = Scan::measure(&settings.dirs);
+    // Dead files inside units that are still in use, which pruning would never
+    // reach. These go regardless of the budget.
+    let replaced = remove_replaced_objects(&scan, dry_run, &out);
+    let replaced_bytes: u64 = replaced.iter().map(|r| r.bytes).sum();
+    scan.total_bytes = scan.total_bytes.saturating_sub(replaced_bytes);
     let over_budget = scan.total_bytes > limit;
     if over_budget || mode == Mode::Status {
         scan.find_units();
@@ -72,6 +77,29 @@ pub fn run(opts: &Opts, cargo_args: &[OsString], mode: Mode) -> Result<()> {
 
     if mode == Mode::Status {
         print_status(&out, &settings, &scan, capacity, limit, goal);
+    }
+    if !replaced.is_empty() {
+        if out.verbose {
+            for r in &replaced {
+                out.status(
+                    if dry_run { "Would remove" } else { "Removing" },
+                    &format!(
+                        "{} replaced object files of {} ({})",
+                        r.files,
+                        r.label,
+                        bytes(r.bytes)
+                    ),
+                );
+            }
+        }
+        out.status(
+            if dry_run { "Would remove" } else { "Removed" },
+            &format!(
+                "{} object files ({}) that newer builds of the same artifacts replaced",
+                replaced.iter().map(|r| r.files).sum::<usize>(),
+                bytes(replaced_bytes)
+            ),
+        );
     }
     if !over_budget {
         stamp::write(&settings.target_dir, &settings.dirs, scan.total_bytes);
@@ -201,6 +229,42 @@ pub fn run(opts: &Opts, cargo_args: &[OsString], mode: Mode) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+struct Replaced {
+    /// The unit, e.g. `debug/app-0123456789abcdef`.
+    label: String,
+    files: usize,
+    bytes: u64,
+}
+
+/// Removes object files that later compiles of the same unit replaced (see
+/// [`scan::replaced_objects`]), or with `dry_run`, only finds them.
+fn remove_replaced_objects(scan: &Scan, dry_run: bool, out: &Output) -> Vec<Replaced> {
+    let mut replaced = Vec::new();
+    for profile in &scan.profiles {
+        // Which objects a unit's outputs use is only settled while no build
+        // is writing them. A busy profile gets its turn next time.
+        let lock = if dry_run { None } else { try_lock(profile) };
+        if !dry_run && lock.is_none() {
+            continue;
+        }
+        let profile_label = scan.label(profile);
+        for (unit, paths) in scan::replaced_objects(profile) {
+            let freed = scan::freed_bytes(&paths);
+            if dry_run || remove_all(&paths, out) {
+                replaced.push(Replaced {
+                    label: format!("{profile_label}/{unit}"),
+                    files: paths.len(),
+                    bytes: freed,
+                });
+            }
+        }
+        // Released before pruning takes the locks again; a second lock on
+        // the same file from this process would count as busy.
+        drop(lock);
+    }
+    replaced
 }
 
 #[derive(Debug, Default)]

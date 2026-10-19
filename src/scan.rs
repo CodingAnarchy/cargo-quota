@@ -20,11 +20,14 @@
 //! naming scheme, so each is its own unit. So are whole output directories
 //! outside the profiles, like `doc/` and `package/` (see [`EXTRA_DIRS`]).
 //!
+//! Units still in use can hold dead files too: see [`replaced_objects`].
+//!
 //! Anything else (`.rustc_info.json`, `.cargo-lock`, ...) counts toward the
 //! total size but is never removed.
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -57,8 +60,9 @@ pub struct Scan {
 
 impl Scan {
     /// Measures `dirs` (target dirs, build dirs, other worktrees' target dirs)
-    /// as one pool. Duplicates and directories nested inside another count
-    /// once. Units aren't grouped until [`Scan::find_units`].
+    /// as one pool, and finds the profile dirs in it. Duplicates and
+    /// directories nested inside another count once. Units aren't grouped
+    /// until [`Scan::find_units`].
     pub fn measure(dirs: &[PathBuf]) -> Scan {
         let seen = Mutex::new(HashSet::new());
         let mut total_bytes = 0;
@@ -68,38 +72,36 @@ impl Scan {
             total_bytes += bytes;
             roots.push((root, bytes));
         }
+        let profiles = roots.iter().flat_map(|(r, _)| find_profiles(r)).collect();
         Scan {
             roots,
-            profiles: Vec::new(),
+            profiles,
             units: Vec::new(),
             total_bytes,
         }
     }
 
+    /// `path` for display, relative to whatever the roots have in common:
+    /// `debug/...` for one target dir, `proj-feature/target/debug/...` across
+    /// worktrees.
+    pub fn label(&self, path: &Path) -> String {
+        let base = common_ancestor(self.roots.iter().map(|(r, _)| r.as_path()));
+        path.strip_prefix(&base)
+            .unwrap_or(path)
+            .display()
+            .to_string()
+    }
+
     /// Groups the roots' contents into units. This walks everything again, so
     /// it's skipped when the pool is under budget.
     pub fn find_units(&mut self) {
-        // Labels are relative to whatever the roots have in common: `debug/...`
-        // for one target dir, `proj-feature/target/debug/...` across worktrees.
-        let base = common_ancestor(self.roots.iter().map(|(r, _)| r.as_path()));
-        self.profiles = self
-            .roots
-            .iter()
-            .flat_map(|(r, _)| find_profiles(r))
-            .collect();
-        let label = |path: &Path| {
-            path.strip_prefix(&base)
-                .unwrap_or(path)
-                .display()
-                .to_string()
-        };
+        let label = |path: &Path| self.label(path);
         // A unit holds hard links to its own files (`debug/app` and
         // `deps/app-<hash>`), and overcounting would stop pruning early.
         let seen = Mutex::new(HashSet::new());
-        self.units.clear();
+        let mut units = Vec::new();
         for (index, profile) in self.profiles.iter().enumerate() {
-            self.units
-                .extend(scan_profile(profile, &label(profile), index, &seen));
+            units.extend(scan_profile(profile, &label(profile), index, &seen));
         }
         // Cargo writes these while holding a profile's lock (`doc/` under
         // `debug/`'s, for instance), so require every lock in the root.
@@ -110,9 +112,10 @@ impl Scan {
             for dir in find_extras(root, &self.profiles) {
                 let mut unit = Unit::new(label(&dir), locks.clone());
                 unit.add(dir, &seen);
-                self.units.push(unit);
+                units.push(unit);
             }
         }
+        self.units = units;
     }
 }
 
@@ -327,6 +330,157 @@ fn unhashed_outputs(
 /// `my-app.exe`, `my-app.dSYM`, ...).
 fn unhashed_owner<'a>(owners: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
     owners.get(name.split('.').next()?).map(String::as_str)
+}
+
+/// Object files in a profile that the unit which wrote them no longer uses,
+/// as `(unit, files)` pairs like `("app-0123456789abcdef", [...])`.
+///
+/// Where debug info stays in the object files (macOS's default
+/// `split-debuginfo = "unpacked"`), rustc leaves a crate's codegen units in
+/// `deps/` beside its output, named `<crate>-<hash>.<cgu>.<invocation>.rcgu.o`.
+/// The last part is new on every compile, so each rebuild of a crate adds a
+/// full set of up to 256 files and never removes the old ones. The unit stays
+/// in use, so pruning never gets to them.
+///
+/// The files the unit's current outputs still need are the ones they name:
+/// a binary's debug map lists its objects by path, and an rlib holds its
+/// objects as members under the same names. Everything else is left over
+/// from earlier compiles. When the outputs don't name any of the files, which
+/// one is current can't be told, so the unit is left alone.
+pub fn replaced_objects(profile: &Path) -> Vec<(String, Vec<PathBuf>)> {
+    let mut replaced = Vec::new();
+    for dir in ["deps", "examples"] {
+        // Keyed by unit hash; a unit's objects are named after its crate,
+        // its outputs sometimes with a `lib` prefix.
+        let mut objects: HashMap<String, Vec<(String, PathBuf)>> = HashMap::new();
+        let mut outputs: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        for (name, path) in entries(&profile.join(dir)) {
+            let Some(hash) = unit_hash(&name).map(str::to_owned) else {
+                continue;
+            };
+            if name.ends_with(".rcgu.o") {
+                objects.entry(hash).or_default().push((name, path));
+            } else if !name.ends_with(".d") && !name.ends_with(".rmeta") {
+                outputs.entry(hash).or_default().push(path);
+            }
+        }
+        for (hash, objects) in objects {
+            if !recompiled(&objects) {
+                continue;
+            }
+            let named: HashSet<String> = outputs
+                .get(&hash)
+                .into_iter()
+                .flatten()
+                .flat_map(|output| named_objects(output))
+                .collect();
+            if !objects.iter().any(|(name, _)| named.contains(name)) {
+                continue;
+            }
+            let unit = objects[0]
+                .0
+                .split('.')
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            let unused: Vec<PathBuf> = objects
+                .into_iter()
+                .filter(|(name, _)| !named.contains(name))
+                .map(|(_, path)| path)
+                .collect();
+            if !unused.is_empty() {
+                replaced.push((unit, unused));
+            }
+        }
+    }
+    replaced.sort();
+    replaced
+}
+
+/// Whether some codegen unit's object file is there from more than one
+/// compile: `<crate>-<hash>.<cgu>.<invocation>.rcgu.o` with the same `<cgu>`
+/// and different `<invocation>`s. Rustc versions that didn't tag objects by
+/// invocation overwrote them instead, so this is never true for those.
+fn recompiled(objects: &[(String, PathBuf)]) -> bool {
+    let mut cgus = HashSet::new();
+    objects.iter().any(|(name, _)| {
+        name.strip_suffix(".rcgu.o")
+            .and_then(|stem| stem.rsplit_once('.'))
+            .is_some_and(|(cgu, _)| !cgus.insert(cgu))
+    })
+}
+
+/// File names of the `.rcgu.o` objects that `output` names anywhere in its
+/// bytes, such as `/…/deps/app-0123456789abcdef.0a1b2c.1x2y3z4.rcgu.o` in a
+/// debug map, or an archive member's name.
+fn named_objects(output: &Path) -> HashSet<String> {
+    const SUFFIX: &[u8] = b".rcgu.o";
+    const CHUNK: usize = 1 << 20;
+    // Carried over between chunks, so a name split across two is still found
+    // whole. File names are at most 255 bytes.
+    const OVERLAP: usize = 256;
+    let is_name_byte = |b: &u8| b.is_ascii_alphanumeric() || b"._-".contains(b);
+
+    let mut names = HashSet::new();
+    let Ok(mut file) = File::open(output) else {
+        return names;
+    };
+    let mut buf = Vec::with_capacity(OVERLAP + CHUNK);
+    loop {
+        let kept = buf.len();
+        buf.resize(kept + CHUNK, 0);
+        let read = match file.read(&mut buf[kept..]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        buf.truncate(kept + read);
+        for end in buf
+            .windows(SUFFIX.len())
+            .enumerate()
+            .filter(|(_, w)| *w == SUFFIX)
+            .map(|(i, _)| i + SUFFIX.len())
+        {
+            let start = buf[..end]
+                .iter()
+                .rposition(|b| !is_name_byte(b))
+                .map_or(0, |i| i + 1);
+            names.insert(String::from_utf8_lossy(&buf[start..end]).into_owned());
+        }
+        buf.drain(..buf.len().saturating_sub(OVERLAP));
+    }
+    names
+}
+
+/// The on-disk space that removing all of `paths` gives back. A file with a
+/// hard link that isn't being removed (rustc links reused objects in from its
+/// incremental cache) stays on disk.
+pub fn freed_bytes(paths: &[PathBuf]) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mut files: HashMap<(u64, u64), (u64, u64, u64)> = HashMap::new();
+        for meta in paths.iter().filter_map(|p| fs::symlink_metadata(p).ok()) {
+            let file = files.entry((meta.dev(), meta.ino())).or_insert((
+                0,
+                meta.nlink(),
+                meta.blocks() * 512,
+            ));
+            file.0 += 1;
+        }
+        files
+            .values()
+            .filter(|(removed, links, _)| removed >= links)
+            .map(|(_, _, bytes)| bytes)
+            .sum()
+    }
+    #[cfg(not(unix))]
+    {
+        paths
+            .iter()
+            .filter_map(|p| fs::symlink_metadata(p).ok())
+            .map(|m| m.len())
+            .sum()
+    }
 }
 
 /// Extracts cargo's metadata hash from an artifact name: the 16 lowercase hex
@@ -637,6 +791,102 @@ mod tests {
         let mut both = Usage::default();
         measure(tmp.path(), &mut both, Some(&Mutex::new(HashSet::new())));
         assert_eq!(both.bytes, one.bytes);
+    }
+
+    #[test]
+    fn finds_objects_that_later_compiles_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deps = tmp.path().join("debug/deps");
+        fs::create_dir_all(&deps).unwrap();
+        let write = |name: &str, contents: &[u8]| fs::write(deps.join(name), contents).unwrap();
+        let obj =
+            |unit: &str, cgu: &str, invocation: &str| format!("{unit}.{cgu}.{invocation}.rcgu.o");
+
+        // A library compiled twice; its rlib holds the second compile's objects.
+        let lib = "dep-0123456789abcdef";
+        for invocation in ["0aaaaaa", "0bbbbbb"] {
+            for cgu in ["cgu1", "cgu2"] {
+                write(&obj(lib, cgu, invocation), b"o");
+            }
+        }
+        let mut rlib = b"!<arch>\n#1/40           ".to_vec();
+        rlib.extend(obj(lib, "cgu1", "0bbbbbb").as_bytes());
+        rlib.extend(b"\0\0garbage\n//\n");
+        rlib.extend(obj(lib, "cgu2", "0bbbbbb").as_bytes());
+        rlib.extend(b"/\n");
+        write(&format!("lib{lib}.rlib"), &rlib);
+        write(&format!("lib{lib}.rmeta"), b"m");
+        write(&format!("{lib}.d"), obj(lib, "cgu1", "0aaaaaa").as_bytes());
+
+        // A binary whose debug map names its objects by full path.
+        let bin = "app-fedcba9876543210";
+        for invocation in ["0cccccc", "0dddddd"] {
+            write(&obj(bin, "main", invocation), b"o");
+        }
+        let current = deps.join(obj(bin, "main", "0dddddd"));
+        write(bin, format!("\0{}\0", current.display()).as_bytes());
+
+        // Compiled twice, but its output doesn't name any objects.
+        let opaque = "opaque-00112233445566ff";
+        for invocation in ["0eeeeee", "0ffffff"] {
+            write(&obj(opaque, "x", invocation), b"o");
+        }
+        write(opaque, b"no names here");
+
+        // Compiled once.
+        let once = "once-ffeeddccbbaa0099";
+        write(&obj(once, "x", "0gggggg"), b"o");
+        write(&format!("lib{once}.rlib"), b"nothing");
+
+        let replaced = replaced_objects(&tmp.path().join("debug"));
+        let names: Vec<(String, Vec<String>)> = replaced
+            .into_iter()
+            .map(|(unit, paths)| {
+                let mut files: Vec<String> = paths
+                    .iter()
+                    .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                    .collect();
+                files.sort();
+                (unit, files)
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                (bin.to_owned(), vec![obj(bin, "main", "0cccccc")]),
+                (
+                    lib.to_owned(),
+                    vec![obj(lib, "cgu1", "0aaaaaa"), obj(lib, "cgu2", "0aaaaaa")]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn finds_object_names_split_across_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("app-0123456789abcdef");
+        let name = "app-0123456789abcdef.main.0aaaaaa.rcgu.o";
+        // Straddles the first 1 MiB read.
+        let mut contents = vec![0u8; (1 << 20) - 10];
+        contents.extend(name.as_bytes());
+        contents.push(0);
+        fs::write(&output, contents).unwrap();
+        assert_eq!(named_objects(&output), HashSet::from([name.to_owned()]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn frees_only_files_with_every_link_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = |name: &str| tmp.path().join(name);
+        fs::write(path("a"), vec![1u8; 64 * 1024]).unwrap();
+        fs::hard_link(path("a"), path("a2")).unwrap();
+        let mut one = Usage::default();
+        measure(&path("a"), &mut one, None);
+
+        assert_eq!(freed_bytes(&[path("a")]), 0);
+        assert_eq!(freed_bytes(&[path("a"), path("a2")]), one.bytes);
     }
 
     #[test]

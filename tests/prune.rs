@@ -1,6 +1,7 @@
 //! End-to-end: build real crates, make some artifacts look stale, prune, and
 //! check that cargo still builds afterward.
 
+use std::collections::HashSet;
 use std::fs::{self, File, FileTimes};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -290,4 +291,71 @@ fn worktrees_share_a_budget_and_stale_worktrees_go_first() {
         mentions(&main.join("target/debug/deps"), "app") > 0,
         "recent worktree was pruned"
     );
+}
+
+/// With macOS's default `split-debuginfo = "unpacked"`, every compile of a
+/// crate leaves a new set of codegen-unit objects in `deps/`.
+#[cfg(target_os = "macos")]
+#[test]
+fn removes_objects_that_rebuilds_replaced() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("app");
+    create_project(&project);
+    let objects = |unit: &str| -> Vec<PathBuf> {
+        walk(&project.join("target/debug/deps"))
+            .into_iter()
+            .filter(|p| {
+                let name = p.file_name().unwrap().to_string_lossy();
+                name.starts_with(unit) && name.ends_with(".rcgu.o")
+            })
+            .collect()
+    };
+    cargo(&project, &["build", "-q"]);
+    let first = objects("app-");
+    assert!(!first.is_empty(), "rustc kept no object files");
+    for n in [1, 2] {
+        fs::write(
+            project.join("src/main.rs"),
+            format!("fn main() {{ println!(\"{{}}\", oldlib::answer() + {n} - {n}); }}\n"),
+        )
+        .unwrap();
+        cargo(&project, &["build", "-q"]);
+    }
+    assert!(objects("app-").len() > first.len());
+
+    // Recently used and well under budget: only the replaced objects go.
+    let stderr = quota(&project, &["prune", "-p", "100"]);
+    assert!(stderr.contains("that newer builds"), "{stderr}");
+    // `app-<hash>.<cgu>.<invocation>.rcgu.o`: one compile's worth remains.
+    let left = objects("app-");
+    let invocations: HashSet<String> = left
+        .iter()
+        .map(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .split('.')
+                .nth(2)
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(invocations.len(), 1, "{left:#?}\n{stderr}");
+    assert!(
+        first.iter().all(|p| !p.exists()),
+        "objects from the first build left behind"
+    );
+    assert!(
+        !objects("oldlib-").is_empty(),
+        "unchanged crate lost its objects"
+    );
+
+    // Cargo considers everything fresh, and the binary still runs.
+    let rebuild = cargo(&project, &["build"]);
+    assert!(!String::from_utf8_lossy(&rebuild.stderr).contains("Compiling"));
+    let run = cargo(&project, &["run", "-q"]);
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "42");
+
+    let again = quota(&project, &["prune", "-p", "100"]);
+    assert!(!again.contains("object files"), "{again}");
 }
