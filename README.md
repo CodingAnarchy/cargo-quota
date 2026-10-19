@@ -218,6 +218,14 @@ Each incremental-compilation cache under `incremental/` is its own unit.
 - **Final outputs** that cargo copies up into the profile directory
   (`target/debug/app`, `libfoo.rlib`, `examples/demo`) are removed with the
   unit that built them.
+- **Replaced object files** are removed whenever the target dir is
+  measured, even under budget. Where debug info stays in object files (the
+  default on macOS), rustc keeps each crate's codegen-unit objects
+  (`deps/app-<hash>.<cgu>.<invocation>.rcgu.o`), and every rebuild adds a
+  new set of up to 256 without removing the old ones. `cargo-quota` keeps the
+  objects that a unit's binary or rlib still names and removes the rest,
+  while holding the profile's lock. Debuggers find their debug info in the
+  objects that are kept.
 - **Whole directories** outside the profiles are units of their own, removed
   all at once when they're the least recently used: `doc/`, `package/`,
   `tmp/` (integration tests' `CARGO_TARGET_TMPDIR`), and the `criterion/` and
