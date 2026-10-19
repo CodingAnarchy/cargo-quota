@@ -38,9 +38,9 @@ fn cargo(dir: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(dir)
         .env_remove("CARGO_TARGET_DIR")
-        // CI caching turns incremental compilation off; build like a dev
-        // machine does.
-        .env_remove("CARGO_INCREMENTAL")
+        // CI turns incremental compilation off; build like a dev machine
+        // does. The variable outranks any cargo config that disables it.
+        .env("CARGO_INCREMENTAL", "1")
         .env("CARGO_TERM_COLOR", "never")
         .output()
         .unwrap();
